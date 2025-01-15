@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# audiblez - A program to convert e-books into audiobooks using
+# Kokoro-82M model for high-quality text-to-speech synthesis.
+# by Claudio Santini 2025 - https://claudio.uk
+# Updated: 2025-01 for improved user experience (sequential mode + logs)
+
 import argparse
 import sys
 import time
@@ -8,40 +14,37 @@ import ebooklib
 import warnings
 import re
 from pathlib import Path
-from string import Formatter
 from bs4 import BeautifulSoup
 from kokoro_onnx import Kokoro
 from ebooklib import epub
 from pick import pick
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from tqdm import tqdm  # Added for progress bar
-from pydub import AudioSegment
+from tqdm import tqdm
 
 
 def main(kokoro, file_path, lang, voice, pick_manually):
     """
-    Main function that processes the EPUB, identifies chapters, and orchestrates
-    parallel TTS generation followed by final audiobook creation.
+    Processes the EPUB, identifies chapters, converts them sequentially to WAV
+    files via Kokoro TTS, and optionally combines into an M4B.
     """
     filename = Path(file_path).name
-    # Create output folder named after the EPUB file (without extension)
+    # Create a folder named after the EPUB file (minus .epub)
     output_folder = Path(filename.replace('.epub', ''))
     output_folder.mkdir(exist_ok=True)
 
     with warnings.catch_warnings():
         book = epub.read_epub(file_path)
 
-    title = book.get_metadata('DC', 'title')[0][0] if book.get_metadata(
-        'DC', 'title') else "Untitled"
-    creator = book.get_metadata('DC', 'creator')[0][0] if book.get_metadata(
-        'DC', 'creator') else "Unknown Author"
+    # Obtain minimal metadata for the intro
+    title = _try_get_metadata(book, 'title', default="Untitled")
+    creator = _try_get_metadata(book, 'creator', default="Unknown Author")
     intro = f"{title} by {creator}"
 
     print(intro)
-    all_documents = [c for c in book.get_items() if c.get_type()
-                     == ebooklib.ITEM_DOCUMENT]
-    print("Found Chapters/Docs:", [c.get_name() for c in all_documents])
+    all_docs = [c for c in book.get_items() if c.get_type() ==
+                ebooklib.ITEM_DOCUMENT]
+    print("Found Chapters/Docs:", [c.get_name() for c in all_docs])
 
+    # Either pick chapters interactively or auto-detect them
     if pick_manually:
         chapters = pick_chapters(book)
     else:
@@ -50,208 +53,197 @@ def main(kokoro, file_path, lang, voice, pick_manually):
     print("Selected chapters:", [c.get_name() for c in chapters])
     texts = extract_texts(chapters)
 
+    # Check for ffmpeg availability
     has_ffmpeg = shutil.which('ffmpeg') is not None
     if not has_ffmpeg:
-        print('\033[91m' + 'ffmpeg not found. Please install ffmpeg to create mp3 and m4b audiobook files.' + '\033[0m')
+        print(
+            '\033[91mffmpeg not found. Please install ffmpeg if you want m4b output.\033[0m')
 
     total_chars = sum(len(t) for t in texts)
     print("Started at:", time.strftime('%H:%M:%S'))
     print(f"Total characters: {total_chars:,}")
     print("Total words:", len(' '.join(texts).split(' ')))
 
-    # Prepare chapter conversion tasks
-    chapter_args = []
-    chapter_indexes = []  # Keep track of chapter indexes that need processing
-    for i, text in enumerate(texts, start=1):
-        if not text.strip():
-            continue
-        # Build the path for the WAV file inside the output folder
-        chapter_filename = output_folder / \
-            filename.replace('.epub', f"_chapter_{i}.wav")
-        # If the file exists, skip re-generation to save time
-        if chapter_filename.exists():
-            print(f"File for chapter {i} already exists. Skipping TTS.")
-        else:
-            # Prepend the intro only for the first chapter
-            actual_text = intro + ".\n\n" + text if i == 1 else text
-            chapter_args.append(
-                (kokoro, actual_text, voice, lang, chapter_filename, i))
-            chapter_indexes.append(i)
+    # Process each chapter sequentially and show progress with tqdm
+    start_time_all = time.time()
+    n_chapters = len(texts)
+    with tqdm(total=n_chapters, desc="Chapters Processed", unit="chapter") as pbar:
+        for i, text in enumerate(texts, start=1):
+            if not text.strip():
+                # Skip empty text
+                pbar.update(1)
+                continue
 
-    # Process chapters in parallel and update progress
-    if chapter_args:
-        with ProcessPoolExecutor() as executor:
-            futures = [executor.submit(process_chapter, args)
-                       for args in chapter_args]
-            # Set up tqdm progress bar with the count of chapters being processed
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing Chapters"):
-                try:
-                    result = future.result()
-                    # Optionally print the per-chapter log message.
-                    print(result)
-                except Exception as e:
-                    print("Error processing a chapter:", e)
-    else:
-        print("All chapters already generated, skipping TTS generation.")
+            chapter_filename = output_folder / \
+                filename.replace('.epub', f"_chapter_{i}.wav")
 
-    # If ffmpeg is available, create the final M4B
+            # Skip existing
+            if chapter_filename.exists():
+                print(f"[Skipping] Chapter {i} => Already exists.")
+                pbar.update(1)
+                continue
+
+            # Prepend intro for first chapter only
+            actual_text = intro + "\n\n" + text if i == 1 else text
+
+            start_chapter_time = time.time()
+            samples, sample_rate = kokoro.create(
+                actual_text, voice=voice, speed=1.0, lang=lang
+            )
+            sf.write(chapter_filename, samples, sample_rate)
+            chapter_duration = time.time() - start_chapter_time
+
+            # Log this chapter’s stats
+            c_len = len(actual_text)
+            c_rate = c_len / chapter_duration if chapter_duration else 0
+            print(
+                f"Chapter {i} done: {chapter_filename}\n"
+                f"    + {c_len:,} chars, took {chapter_duration:.2f} s, ~{c_rate:.0f} chars/s"
+            )
+
+            pbar.update(1)
+
+    # Summarize total time
+    total_time = time.time() - start_time_all
+    print(f"All chapters processed in {total_time:.2f} seconds.")
+
+    # Create an M4B file via ffmpeg if available
     if has_ffmpeg:
-        # We rely on ffmpeg's concat mode for a faster combine process
-        create_m4b_ffmpeg_concat(chapter_count=len(
-            texts), output_folder=output_folder, filename=filename)
+        create_m4b_ffmpeg_concat(n_chapters, output_folder, filename)
     else:
-        print("Skipping M4B creation as ffmpeg is not found.")
+        print("Skipping M4B creation (ffmpeg not found).")
 
 
-def process_chapter(args):
-    """
-    Worker function to process each chapter text with Kokoro TTS.
-    """
-    kokoro, text, voice, lang, chapter_filename, chapter_index = args
-    start_time = time.time()
-
-    samples, sample_rate = kokoro.create(
-        text, voice=voice, speed=1.0, lang=lang)
-    sf.write(chapter_filename, samples, sample_rate)
-
-    end_time = time.time()
-    delta_seconds = end_time - start_time
-    chars_per_sec = len(text) / delta_seconds if delta_seconds else 0
-    msg = (
-        f"Chapter {chapter_index} written to {chapter_filename}. "
-        f"Took {delta_seconds:.2f} seconds ({chars_per_sec:.0f} chars/s)."
-    )
-    return msg
+def _try_get_metadata(book, field, default="Unknown"):
+    """Helper to get a piece of metadata from an epub, or return default."""
+    data = book.get_metadata('DC', field)
+    if not data or not data[0] or not data[0][0]:
+        return default
+    return data[0][0]
 
 
 def extract_texts(chapters):
+    """Extract text from each chapter item, returning a list of strings."""
     texts = []
     for chapter in chapters:
         xml = chapter.get_body_content()
-        soup = BeautifulSoup(xml, features='lxml')
-        chapter_text = ''
-        html_content_tags = ['title', 'p', 'h1', 'h2', 'h3', 'h4']
-        for child in soup.find_all(html_content_tags):
-            inner_text = child.text.strip() if child.text else ""
-            if inner_text:
-                chapter_text += inner_text + '\n'
+        soup = BeautifulSoup(xml, "lxml")
+        chapter_text = ""
+        # Merge relevant HTML tags' text
+        for child in soup.find_all(["title", "p", "h1", "h2", "h3", "h4"]):
+            if child.text:
+                chapter_text += child.text.strip() + "\n"
         texts.append(chapter_text)
     return texts
 
 
 def is_chapter(c):
+    """Heuristic to guess if an item name likely represents a main chapter."""
     name = c.get_name().lower()
-    part = r"part\d{1,3}"
-    if re.search(part, name):
+    if re.search(r"part\d{1,3}", name):
         return True
-    ch = r"ch\d{1,3}"
-    if re.search(ch, name):
+    if re.search(r"ch\d{1,3}", name):
         return True
     if "chapter" in name:
         return True
+    return False
 
 
 def find_chapters(book, verbose=False):
-    chapters = [c for c in book.get_items() if c.get_type() ==
-                ebooklib.ITEM_DOCUMENT and is_chapter(c)]
+    """Auto-detect chapters or default to all document items."""
+    chapters = [c for c in book.get_items()
+                if c.get_type() == ebooklib.ITEM_DOCUMENT and is_chapter(c)]
     if verbose:
         for item in book.get_items():
             if item.get_type() == ebooklib.ITEM_DOCUMENT:
-                print(
-                    f"'{item.get_name()}' -> length: {len(item.get_body_content())}")
-    if len(chapters) == 0:
-        print("No obvious chapters found. Defaulting to all available documents.")
+                size = len(item.get_body_content())
+                label = "X" if item in chapters else "-"
+                print(f"{item.get_name()}  (size={size})  [{label}]")
+
+    if not chapters:
+        print("No obvious chapters found. Defaulting to all available document items.")
         chapters = [c for c in book.get_items() if c.get_type() ==
                     ebooklib.ITEM_DOCUMENT]
     return chapters
 
 
 def pick_chapters(book):
-    all_chapters_names = [c.get_name() for c in book.get_items(
-    ) if c.get_type() == ebooklib.ITEM_DOCUMENT]
-    title = 'Select which chapters to read in the audiobook'
-    selected_chapters_names = pick(
-        all_chapters_names, title, multiselect=True, min_selection_count=1)
-    selected_chapters_names = [c[0] for c in selected_chapters_names]
-    selected_chapters = [c for c in book.get_items(
-    ) if c.get_name() in selected_chapters_names]
-    return selected_chapters
-
-
-def strfdelta(tdelta, fmt='{D:02}d {H:02}h {M:02}m {S:02}s'):
-    remainder = int(tdelta)
-    f = Formatter()
-    desired_fields = [field_tuple[1] for field_tuple in f.parse(fmt)]
-    possible_fields = ('W', 'D', 'H', 'M', 'S')
-    constants = {'W': 604800, 'D': 86400, 'H': 3600, 'M': 60, 'S': 1}
-    values = {}
-    for field in possible_fields:
-        if field in desired_fields and field in constants:
-            values[field], remainder = divmod(remainder, constants[field])
-    return f.format(fmt, **values)
+    """Interactive pick from the doc items. Not recommended for Colab."""
+    all_chapters = [c for c in book.get_items() if c.get_type()
+                    == ebooklib.ITEM_DOCUMENT]
+    names = [c.get_name() for c in all_chapters]
+    title = "Select which chapters to convert:"
+    selection = pick(names, title, multiselect=True, min_selection_count=1)
+    chosen_names = [sel[0] for sel in selection]
+    # Return the chosen chapters
+    return [c for c in all_chapters if c.get_name() in chosen_names]
 
 
 def create_m4b_ffmpeg_concat(chapter_count, output_folder, filename):
     """
-    Use ffmpeg's concat demuxer for faster combining of .wav files into a single M4B.
+    Use ffmpeg's concat demuxer to combine .wav files in the subfolder
+    into a single .m4b audiobook.
     """
     print("Creating M4B via ffmpeg concat...")
+
     # Build a text file with the list of WAV files in correct order
     concat_file = output_folder / "wav_list.txt"
     with open(concat_file, "w") as f:
-        for i in range(1, chapter_count+1):
+        for i in range(1, chapter_count + 1):
             wav_file = output_folder / \
-                filename.replace('.epub', f"_chapter_{i}.wav")
+                filename.replace(".epub", f"_chapter_{i}.wav")
             if wav_file.exists():
                 f.write(f"file '{wav_file}'\n")
 
-    tmp_filename = output_folder / filename.replace('.epub', '.tmp.m4a')
-    final_filename = output_folder / filename.replace('.epub', '.m4b')
+    tmp_filename = output_folder / filename.replace(".epub", ".tmp.m4a")
+    final_filename = output_folder / filename.replace(".epub", ".m4b")
 
+    # Step 1) Combine all .wav into .m4a
     subprocess.run([
-        'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-        '-i', str(concat_file),
-        '-c:a', 'aac', '-b:a', '64k',
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", str(concat_file),
+        "-c:a", "aac", "-b:a", "64k",
         str(tmp_filename)
     ], check=True)
 
+    # Step 2) Convert .m4a to .m4b container
     subprocess.run([
-        'ffmpeg', '-y', '-i', str(tmp_filename),
-        '-c', 'copy', '-f', 'mp4', str(final_filename)
+        "ffmpeg", "-y", "-i", str(tmp_filename),
+        "-c", "copy", "-f", "mp4", str(final_filename)
     ], check=True)
 
+    # Cleanup
     tmp_filename.unlink(missing_ok=True)
     concat_file.unlink(missing_ok=True)
 
-    print(
-        f"M4B created: {final_filename}\nYou can delete the .wav files if desired.")
+    print(f"Finished combining into M4B: {final_filename}")
+    print("Feel free to delete the .wav files if desired.")
 
 
 def cli_main():
     if not Path('kokoro-v0_19.onnx').exists() or not Path('voices.json').exists():
-        print('Error: kokoro-v0_19.onnx and voices.json must be in the current directory. Please download them with:')
-        print('wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v0_19.onnx')
-        print('wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.json')
+        print('Error: You must have kokoro-v0_19.onnx and voices.json in the current directory.')
         sys.exit(1)
 
+    # Instantiate Kokoro
     kokoro = Kokoro('kokoro-v0_19.onnx', 'voices.json')
     voices = list(kokoro.get_voices())
-    voices_str = ', '.join(voices)
-    epilog = "example:\n  audiblez book.epub -l en-us -v af_sky"
+    voices_str = ", ".join(voices)
     default_voice = 'af_sky' if 'af_sky' in voices else voices[0]
+
+    epilog = "Example:\n  audiblez my_book.epub -l en-us -v af_sky"
     parser = argparse.ArgumentParser(
-        epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('epub_file_path', help='Path to the epub file')
-    parser.add_argument('-l', '--lang', default='en-gb',
-                        help='Language code: en-gb, en-us, fr-fr, ja, ko, cmn')
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('epub_file_path', help='Path to the .epub file')
+    parser.add_argument('-l', '--lang', default='en-gb', help='Language code')
     parser.add_argument('-v', '--voice', default=default_voice,
-                        help=f'Choose narrating voice: {voices_str}')
-    parser.add_argument('-p', '--pick', default=False,
-                        help='Manually select chapters (interactive)', action='store_true')
-    if len(sys.argv) == 1:
-        parser.print_help(sys.stderr)
-        sys.exit(1)
+                        help=f'Choose voice: {voices_str}')
+    parser.add_argument('-p', '--pick', default=False, action='store_true',
+                        help='Manually pick chapters (interactive)')
     args = parser.parse_args()
+
     main(kokoro, args.epub_file_path, args.lang, args.voice, args.pick)
 
 
