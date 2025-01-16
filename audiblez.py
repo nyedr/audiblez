@@ -197,10 +197,11 @@ def create_m4b_ffmpeg_concat(chapter_count, output_folder, filename):
 def cli_main():
     import onnxruntime as ort
 
-    # Try to create a GPU-based session if available:
+    # Define the providers to use
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     session_options = ort.SessionOptions()
     try:
+        # Attempt to create a GPU-based session
         session = ort.InferenceSession(
             "kokoro-v0_19.onnx",
             providers=providers,
@@ -215,10 +216,9 @@ def cli_main():
             sess_options=session_options
         )
 
-    # IMPORTANT:
-    # Initialize Kokoro with its model path and voice file,
-    # then override the session with our GPU (or fallback CPU) session.
+    # Initialize Kokoro with its model path and voice file
     kokoro = Kokoro("kokoro-v0_19.onnx", "voices.json")
+    # Override the session with the GPU (or fallback CPU) session
     kokoro.session = session
 
     # Continue with the rest of cli_main as before.
