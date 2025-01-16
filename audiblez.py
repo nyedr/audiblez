@@ -2,7 +2,7 @@
 # audiblez - A program to convert e-books into audiobooks using
 # Kokoro-82M model for high-quality text-to-speech synthesis.
 # by Claudio Santini 2025 - https://claudio.uk
-# Updated: 2025-01 for improved user experience (sequential mode + logs)
+# Updated: 2025-01 for improved user experience and GPU usage
 
 import argparse
 import sys
@@ -15,6 +15,8 @@ import warnings
 import re
 from pathlib import Path
 from bs4 import BeautifulSoup
+# NEW: import onnxruntime and pass GPU providers to Kokoro
+import onnxruntime as ort
 from kokoro_onnx import Kokoro
 from ebooklib import epub
 from pick import pick
@@ -27,14 +29,12 @@ def main(kokoro, file_path, lang, voice, pick_manually):
     files via Kokoro TTS, and optionally combines into an M4B.
     """
     filename = Path(file_path).name
-    # Create a folder named after the EPUB file (minus .epub)
     output_folder = Path(filename.replace('.epub', ''))
     output_folder.mkdir(exist_ok=True)
 
     with warnings.catch_warnings():
         book = epub.read_epub(file_path)
 
-    # Obtain minimal metadata for the intro
     title = _try_get_metadata(book, 'title', default="Untitled")
     creator = _try_get_metadata(book, 'creator', default="Unknown Author")
     intro = f"{title} by {creator}"
@@ -44,7 +44,6 @@ def main(kokoro, file_path, lang, voice, pick_manually):
                 ebooklib.ITEM_DOCUMENT]
     print("Found Chapters/Docs:", [c.get_name() for c in all_docs])
 
-    # Either pick chapters interactively or auto-detect them
     if pick_manually:
         chapters = pick_chapters(book)
     else:
@@ -53,37 +52,31 @@ def main(kokoro, file_path, lang, voice, pick_manually):
     print("Selected chapters:", [c.get_name() for c in chapters])
     texts = extract_texts(chapters)
 
-    # Check for ffmpeg availability
     has_ffmpeg = shutil.which('ffmpeg') is not None
     if not has_ffmpeg:
-        print(
-            '\033[91mffmpeg not found. Please install ffmpeg if you want m4b output.\033[0m')
+        print('\033[91mffmpeg not found. No m4b creation.\033[0m')
 
     total_chars = sum(len(t) for t in texts)
     print("Started at:", time.strftime('%H:%M:%S'))
     print(f"Total characters: {total_chars:,}")
     print("Total words:", len(' '.join(texts).split(' ')))
 
-    # Process each chapter sequentially and show progress with tqdm
     start_time_all = time.time()
     n_chapters = len(texts)
     with tqdm(total=n_chapters, desc="Chapters Processed", unit="chapter") as pbar:
         for i, text in enumerate(texts, start=1):
             if not text.strip():
-                # Skip empty text
                 pbar.update(1)
                 continue
 
             chapter_filename = output_folder / \
                 filename.replace('.epub', f"_chapter_{i}.wav")
 
-            # Skip existing
             if chapter_filename.exists():
                 print(f"[Skipping] Chapter {i} => Already exists.")
                 pbar.update(1)
                 continue
 
-            # Prepend intro for first chapter only
             actual_text = intro + "\n\n" + text if i == 1 else text
 
             start_chapter_time = time.time()
@@ -93,7 +86,6 @@ def main(kokoro, file_path, lang, voice, pick_manually):
             sf.write(chapter_filename, samples, sample_rate)
             chapter_duration = time.time() - start_chapter_time
 
-            # Log this chapter’s stats
             c_len = len(actual_text)
             c_rate = c_len / chapter_duration if chapter_duration else 0
             print(
@@ -103,19 +95,16 @@ def main(kokoro, file_path, lang, voice, pick_manually):
 
             pbar.update(1)
 
-    # Summarize total time
     total_time = time.time() - start_time_all
     print(f"All chapters processed in {total_time:.2f} seconds.")
 
-    # Create an M4B file via ffmpeg if available
     if has_ffmpeg:
         create_m4b_ffmpeg_concat(n_chapters, output_folder, filename)
     else:
-        print("Skipping M4B creation (ffmpeg not found).")
+        print("Skipping M4B creation (no ffmpeg).")
 
 
 def _try_get_metadata(book, field, default="Unknown"):
-    """Helper to get a piece of metadata from an epub, or return default."""
     data = book.get_metadata('DC', field)
     if not data or not data[0] or not data[0][0]:
         return default
@@ -123,13 +112,12 @@ def _try_get_metadata(book, field, default="Unknown"):
 
 
 def extract_texts(chapters):
-    """Extract text from each chapter item, returning a list of strings."""
     texts = []
+    from lxml import etree
     for chapter in chapters:
         xml = chapter.get_body_content()
         soup = BeautifulSoup(xml, "lxml")
         chapter_text = ""
-        # Merge relevant HTML tags' text
         for child in soup.find_all(["title", "p", "h1", "h2", "h3", "h4"]):
             if child.text:
                 chapter_text += child.text.strip() + "\n"
@@ -138,7 +126,6 @@ def extract_texts(chapters):
 
 
 def is_chapter(c):
-    """Heuristic to guess if an item name likely represents a main chapter."""
     name = c.get_name().lower()
     if re.search(r"part\d{1,3}", name):
         return True
@@ -150,7 +137,6 @@ def is_chapter(c):
 
 
 def find_chapters(book, verbose=False):
-    """Auto-detect chapters or default to all document items."""
     chapters = [c for c in book.get_items()
                 if c.get_type() == ebooklib.ITEM_DOCUMENT and is_chapter(c)]
     if verbose:
@@ -158,35 +144,27 @@ def find_chapters(book, verbose=False):
             if item.get_type() == ebooklib.ITEM_DOCUMENT:
                 size = len(item.get_body_content())
                 label = "X" if item in chapters else "-"
-                print(f"{item.get_name()}  (size={size})  [{label}]")
+                print(f"{item.get_name()} (size={size}) [{label}]")
 
     if not chapters:
-        print("No obvious chapters found. Defaulting to all available document items.")
+        print("No obvious chapters found. Using all document items.")
         chapters = [c for c in book.get_items() if c.get_type() ==
                     ebooklib.ITEM_DOCUMENT]
     return chapters
 
 
 def pick_chapters(book):
-    """Interactive pick from the doc items. Not recommended for Colab."""
     all_chapters = [c for c in book.get_items() if c.get_type()
                     == ebooklib.ITEM_DOCUMENT]
     names = [c.get_name() for c in all_chapters]
     title = "Select which chapters to convert:"
     selection = pick(names, title, multiselect=True, min_selection_count=1)
     chosen_names = [sel[0] for sel in selection]
-    # Return the chosen chapters
     return [c for c in all_chapters if c.get_name() in chosen_names]
 
 
 def create_m4b_ffmpeg_concat(chapter_count, output_folder, filename):
-    """
-    Use ffmpeg's concat demuxer to combine .wav files in the subfolder
-    into a single .m4b audiobook.
-    """
     print("Creating M4B via ffmpeg concat...")
-
-    # Build a text file with the list of WAV files in correct order
     concat_file = output_folder / "wav_list.txt"
     with open(concat_file, "w") as f:
         for i in range(1, chapter_count + 1):
@@ -198,7 +176,6 @@ def create_m4b_ffmpeg_concat(chapter_count, output_folder, filename):
     tmp_filename = output_folder / filename.replace(".epub", ".tmp.m4a")
     final_filename = output_folder / filename.replace(".epub", ".m4b")
 
-    # Step 1) Combine all .wav into .m4a
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
         "-i", str(concat_file),
@@ -206,42 +183,66 @@ def create_m4b_ffmpeg_concat(chapter_count, output_folder, filename):
         str(tmp_filename)
     ], check=True)
 
-    # Step 2) Convert .m4a to .m4b container
     subprocess.run([
         "ffmpeg", "-y", "-i", str(tmp_filename),
         "-c", "copy", "-f", "mp4", str(final_filename)
     ], check=True)
 
-    # Cleanup
     tmp_filename.unlink(missing_ok=True)
     concat_file.unlink(missing_ok=True)
-
-    print(f"Finished combining into M4B: {final_filename}")
-    print("Feel free to delete the .wav files if desired.")
+    print(f"Finished combining into M4B: {final_filename}\n"
+          f"You can delete the .wav files if you like.")
 
 
 def cli_main():
-    if not Path('kokoro-v0_19.onnx').exists() or not Path('voices.json').exists():
-        print('Error: You must have kokoro-v0_19.onnx and voices.json in the current directory.')
-        sys.exit(1)
+    import onnxruntime as ort
 
-    # Instantiate Kokoro
-    kokoro = Kokoro('kokoro-v0_19.onnx', 'voices.json')
+    # Try to create a GPU-based session if available:
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    session_options = ort.SessionOptions()
+    try:
+        session = ort.InferenceSession(
+            "kokoro-v0_19.onnx",
+            providers=providers,
+            sess_options=session_options
+        )
+        print("ONNX Runtime GPU session created successfully.")
+    except Exception as e:
+        print("GPU session initialization failed, falling back to CPU.\n", e)
+        session = ort.InferenceSession(
+            "kokoro-v0_19.onnx",
+            providers=["CPUExecutionProvider"],
+            sess_options=session_options
+        )
+
+    # IMPORTANT:
+    # Initialize Kokoro with its model path and voice file,
+    # then override the session with our GPU (or fallback CPU) session.
+    kokoro = Kokoro("kokoro-v0_19.onnx", "voices.json")
+    kokoro.session = session
+
+    # Continue with the rest of cli_main as before.
     voices = list(kokoro.get_voices())
     voices_str = ", ".join(voices)
-    default_voice = 'af_sky' if 'af_sky' in voices else voices[0]
+    default_voice = "af_sky" if "af_sky" in voices else voices[0]
 
     epilog = "Example:\n  audiblez my_book.epub -l en-us -v af_sky"
     parser = argparse.ArgumentParser(
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument('epub_file_path', help='Path to the .epub file')
-    parser.add_argument('-l', '--lang', default='en-gb', help='Language code')
-    parser.add_argument('-v', '--voice', default=default_voice,
-                        help=f'Choose voice: {voices_str}')
-    parser.add_argument('-p', '--pick', default=False, action='store_true',
-                        help='Manually pick chapters (interactive)')
+    parser.add_argument("epub_file_path", help="Path to the .epub file")
+    parser.add_argument("-l", "--lang", default="en-gb", help="Language code")
+    parser.add_argument("-v", "--voice", default=default_voice,
+                        help=f"Choose voice: {voices_str}")
+    parser.add_argument("-p", "--pick", default=False, action="store_true",
+                        help="Manually pick chapters (interactive)")
+
+    if not Path("kokoro-v0_19.onnx").exists() or not Path("voices.json").exists():
+        print(
+            "Error: kokoro-v0_19.onnx and voices.json must exist in the current directory.")
+        sys.exit(1)
+
     args = parser.parse_args()
 
     main(kokoro, args.epub_file_path, args.lang, args.voice, args.pick)
